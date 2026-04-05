@@ -1,0 +1,102 @@
+Task 3 — Security & Access Control
+
+3a. IAM & Role-Based Access Control
+Least-Privilege IAM Roles
+We implemented strict least-privilege access using three dedicated IAM roles (one per tenant type), as defined in Task 1:
+
+* company-role
+* bureau-role
+* employee-role
+
+Each role is assumable only by EC2 instances belonging to that tenant type via an Instance Profile.
+
+Key Policies Enforced:
+* Company Role: Full access only to S3 prefix /company/${tenant_id}/* and ability to read/write only records where tenant_id matches in RDS (via application + RLS).
+* Bureau Role: Access restricted to /bureau/${tenant_id}/* and only to clients assigned to that bureau.
+* Employee Role: Highly restricted — can only access /employee/${employee_id}/* and their own payroll records.
+
+No Hardcoded Credentials:
+* All credentials and secrets are fetched dynamically at runtime.
+* IAM roles are attached to EC2 instances using aws_iam_instance_profile.
+* No AWS access keys or secret keys are stored in code, user_data, or environment variables.
+
+This ensures that even if one tenant’s EC2 is compromised, the attacker cannot access resources belonging to other tenants.
+
+3b. Secrets Management
+Approach: AWS Secrets Manager (with automatic rotation capability)
+
+Implementation:
+1. RDS Credentials:
+   -> A random password is generated using the random_password resource.
+   -> The username + password + connection details are stored as a JSON secret in AWS Secrets Manager under the name payroll/rds/credentials.
+
+2. Secret Injection at Runtime:
+   -> EC2 instances are granted permission to read the secret via their IAM role.
+   -> At application startup (or via user_data), the application fetches the secret using the AWS SDK:
+      Bash
+      aws secretsmanager get-secret-value --secret-id payroll/rds/credentials
+
+   -> The secret is loaded into memory only (never written to disk or logs).
+   -> For production, we use the AWS Secrets Manager Agent or AWS SDK caching to reduce API calls and improve performance.
+
+3. Other Secrets (API keys, JWT signing keys, etc.):
+   -> Also stored in Secrets Manager.
+   -> Retrieved using the same pattern with tenant-scoped IAM roles.
+
+This approach ensures no sensitive values are present in Terraform state (except as sensitive outputs), code, or logs.
+
+3c. Encryption
+Encryption at Rest:
+* RDS: Encryption at rest is enabled using AWS-managed KMS key (storage_encrypted = true).
+* S3 Bucket: Server-side encryption is enforced using SSE-S3 (AES-256) by default. We also added a bucket policy to deny any unencrypted uploads:
+
+  JSON
+  {
+    "Effect": "Deny",
+    "Principal": "*",
+    "Action": "s3:PutObject",
+    "Resource": "arn:aws:s3:::payroll-documents-bucket/*",
+    "Condition": {
+      "StringNotEquals": {
+        "s3:x-amz-server-side-encryption": "AES256"
+      }
+    }
+  }
+
+Encryption in Transit (Data Protection):
+* All services use TLS 1.2+:
+   -> Application Load Balancer (if added later) enforces HTTPS only.
+   -> RDS: SSL/TLS is enforced by setting require_ssl = true in the parameter group.
+   -> API communication between EC2 instances and RDS uses SSL.
+   -> S3 access is always over HTTPS.
+* Security Groups are configured to allow only encrypted ports (e.g., 443 for HTTPS, 5432 with SSL for PostgreSQL).
+
+This ensures all sensitive payroll data is encrypted both at rest and in transit.
+
+3d. Network Security
+Security Groups & NACLs Configuration:
+
+* Security Groups (Stateful):
+   -> Each tenant has its own Security Group (company-sg, bureau-sg, employee-sg).
+   -> Rules are very restrictive:
+       => Inbound: Only allow traffic from the Application Load Balancer (future) or specific ports from within the VPC.
+       => Outbound: Limited to RDS (port 5432), S3 (via VPC Endpoint), and necessary external services.
+   -> No security group allows inbound SSH from the internet.
+
+* Network ACLs (Stateless – Defense in Depth):
+   -> Applied at the private subnet level.
+   -> Explicitly allow only required traffic (e.g., TCP 5432 from tenant EC2s to RDS).
+   -> Deny all other traffic by default.
+
+Database & Internal Services Protection:
+* RDS is deployed in private subnets only (publicly_accessible = false).
+* No public IP is assigned to any EC2 instance or RDS.
+* All outbound internet access from private subnets goes through NAT Gateway.
+
+Preventing Cross-Tenant Traffic:
+* Each tenant’s EC2 instances are attached only to their own Security Group.
+* Security Groups do not allow ingress from other tenant’s security groups.
+* NACLs at the subnet level provide an additional layer that blocks unauthorized traffic even if Security Group rules are misconfigured.
+* Combined with IAM roles and S3 bucket policies, this creates strong infrastructure-level isolation.
+
+Even in the worst-case scenario (e.g., application-level tenant check fails), the network layer + IAM + S3 policies prevent one tenant from reaching another tenant’s compute or data layer.

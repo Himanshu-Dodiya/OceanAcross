@@ -1,0 +1,113 @@
+Task 2 — Multi-Tenancy Architecture
+
+2a. Tenant Isolation Strategy
+Chosen Model: Shared Database with tenant_id scoping + Row-Level Security (RLS)
+
+Justification:
+-> Payroll data is highly sensitive (contains personal financial information, tax data, and PII). Strong isolation is mandatory for compliance (GDPR, CCPA, SOC 2, etc.).
+-> Database-per-tenant would provide the strongest isolation but is very expensive and operationally complex (many RDS instances, higher cost, harder backups & monitoring).
+-> Schema-per-tenant is a good middle ground, but PostgreSQL RLS on a single schema is more performant and easier to manage at scale.
+-> Shared database + tenant_id + RLS gives the best balance of:
+    => Strong security (data is physically in one DB but logically isolated)
+    => Cost efficiency
+    => Simple backups, monitoring, and scaling
+    => Easy cross-tenant reporting (when needed for internal admin)
+
+This model was chosen because the infrastructure already uses one RDS instance (from Task 1). It is the most practical and widely adopted pattern for SaaS payroll/HR platforms.
+
+How Tenant Context is Established and Propagated:
+1. Login Flow:
+   -> User logs in via their portal (company portal / bureau portal / employee portal).
+   -> Authentication service validates credentials and issues a JWT token.
+   -> The JWT contains:
+       => user_id
+       => tenant_id
+       => tenant_type (company / bureau / employee)
+       => role
+
+2. Request Lifecycle (Secure Propagation):
+   -> Every API request carries the JWT in the Authorization header.
+   -> Middleware (API Gateway or application layer) extracts and validates the JWT.
+   -> Tenant context is stored in a request-scoped context (e.g., using context.WithValue in Go, or request object in Node.js/Python).
+   -> All subsequent service calls and database queries use this context.
+
+3. Guaranteeing No Cross-Tenant Leakage:
+   -> Every database table has a tenant_id column.
+   -> PostgreSQL Row-Level Security (RLS) is enabled on all tables:
+      SQL
+      CREATE POLICY tenant_isolation ON payroll_records
+      USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+
+   -> Before any query, the application sets:
+      SQL
+      SET app.current_tenant_id = 'abc-123';
+
+   -> Even if application code forgets to filter by tenant_id, the database itself blocks cross-tenant data.
+   -> All queries are written with WHERE tenant_id = current_tenant_id as an extra safety layer.
+
+This creates defense in depth: application logic + database enforcement.
+
+2b. Access Boundaries at the Infrastructure Layer
+IAM Roles (One per Portal Type)
+-> We created three separate IAM roles (already implemented in Task 1):
+    => company-role
+    => bureau-role
+    => employee-role
+
+-> Each role is attached only to the EC2 instances of that tenant type.
+-> Permissions are least-privilege and scoped strictly by tenant.
+
+S3 Bucket Policy Enforcement
+-> S3 bucket uses prefix-based isolation:
+    => /company/<company_id>/...
+    => /bureau/<bureau_id>/...
+    => /employee/<employee_id>/...
+
+Bucket Policy Example (enforced at infrastructure level):
+JSON
+{
+  "Effect": "Deny",
+  "Principal": "*",
+  "Action": ["s3:GetObject", "s3:ListBucket"],
+  "Resource": [
+    "arn:aws:s3:::payroll-documents-bucket/company/*",
+    "arn:aws:s3:::payroll-documents-bucket/bureau/*",
+    "arn:aws:s3:::payroll-documents-bucket/employee/*"
+  ],
+  "Condition": {
+    "StringNotEquals": {
+      "s3:prefix": [
+        "company/${aws:PrincipalTag/TenantId}/*",
+        "bureau/${aws:PrincipalTag/TenantId}/*",
+        "employee/${aws:PrincipalTag/TenantId}/*"
+      ]
+    }
+  }
+}
+
+Infrastructure as Second Enforcement Boundary:
+-> Security Groups + NACLs block network-level cross-talk between tenant EC2s.
+-> IAM roles + S3 bucket policies act as the last line of defense.
+-> If the application is compromised, the attacker is still confined to their own tenant’s data.
+
+2c. Tenant Onboarding & Offboarding
+Onboarding a New Tenant (Company or Bureau)
+1. Admin creates tenant via internal admin panel.
+2. System automatically:
+   -> Generates a unique tenant_id
+   -> Creates tenant-specific records in tenants table
+   -> Provisions IAM role (if new company/bureau)
+   -> Creates S3 prefix (e.g., /company/new-company-uuid/)
+   -> Assigns the correct IAM role to the new EC2 (or scales existing EC2)
+3. Tenant is isolated from day one — no data exists yet, and RLS + IAM policies are already enforced.
+
+Offboarding a Tenant
+1. Mark tenant as inactive in the tenants table.
+2. Revoke IAM role permissions immediately.
+3. Delete all data belonging to that tenant_id:
+   -> Cascade delete in PostgreSQL (or soft delete + background purge)
+   -> Delete S3 prefix recursively
+4. Remove EC2 association (if dedicated) and rotate any secrets.
+5. Create full audit trail (who initiated offboarding, when, what was deleted).
+
+All offboarding actions are logged in CloudTrail + application audit log for compliance.
