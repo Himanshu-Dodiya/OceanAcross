@@ -1,0 +1,111 @@
+Task 5 — Monitoring & Incident Readiness
+
+5a. SNS Alert for Critical Failures
+We created an SNS topic to notify the team via email whenever any critical CloudWatch alarm fires.
+
+Setup (via AWS Console):
+1. Go to SNS -> Topics -> Create Topic
+   -> Type: Standard
+   -> Name: payroll-critical-alerts
+2. Create Subscription:
+   -> Protocol: Email
+   -> Endpoint: (team email address)
+3. Confirmed the subscription via the confirmation email sent by AWS.
+
+This topic is used as the notification target for all CloudWatch alarms configured below.
+
+5b. CloudWatch Alarm — EC2 CPU Utilisation (Demonstrated Live)
+We configured and tested a CloudWatch alarm on a running EC2 instance to monitor CPU utilisation.
+
+Setup (via AWS Console):
+1. Go to CloudWatch -> Alarms -> Create Alarm
+2. Select Metric -> EC2 -> Per-Instance Metrics -> CPUUtilization
+3. Select the running EC2 instance
+4. Configure the alarm:
+   -> Alarm Name: payroll-ec2-cpu-high
+   -> Threshold: Greater than 80% (Static)
+   -> Period: 5 minutes
+   -> Datapoints to alarm: 3 out of 3 (3 consecutive breaches)
+   -> Treat missing data as: Breaching
+5. Notification: Send to SNS topic "payroll-critical-alerts"
+
+We chose 80% threshold (not 90%) because:
+-> On t2.micro/t3.micro instances, CPU spikes can saturate quickly.
+-> 3 consecutive evaluation periods (15 minutes total) avoids false alarms from short bursts.
+-> Early alerting gives the team time to investigate before users are impacted.
+
+Testing:
+-> We SSH'd into the EC2 instance and ran a CPU stress command to push utilisation to 100%.
+-> After 3 consecutive 5-minute evaluation periods, the alarm transitioned to "In alarm" state.
+-> An email notification was received via the SNS subscription confirming the alert.
+-> Screenshots of the alarm in "In alarm" state and the email notification are included as proof.
+
+In production, we would create one alarm per tenant EC2 instance:
+-> payroll-companies-cpu-high
+-> payroll-bureaus-cpu-high
+-> payroll-employees-cpu-high
+
+5c. CloudWatch Alarms — RDS (Same Approach, Not Spun Up to Avoid Free Tier Charges)
+RDS (db.t3.micro) was not provisioned for this demonstration to avoid potential free tier overages. However, the setup follows the exact same pattern as the EC2 alarm above. Here is what we would configure:
+
+Alarm 1: RDS Database Connections
+-> CloudWatch -> Alarms -> Create Alarm
+-> Select Metric -> RDS -> Per-Database Metrics -> DatabaseConnections
+-> Select the RDS instance identifier (e.g., payroll-db)
+-> Threshold: Greater than 50 connections (Static)
+-> Period: 5 minutes
+-> Datapoints to alarm: 2 out of 2
+-> Treat missing data as: Not breaching
+-> Notification: payroll-critical-alerts SNS topic
+
+Why 50 connections?
+-> db.t3.micro has a max_connections limit of ~66 (based on instance memory).
+-> 50 is roughly 75% of 66 — gives enough warning before connections are exhausted.
+-> Hitting this usually means a connection leak or unexpected traffic spike.
+
+Alarm 2: RDS CPU Utilisation
+-> Same steps as EC2 CPU alarm above, but under RDS -> Per-Database Metrics -> CPUUtilization
+-> Threshold: Greater than 80%, 3 consecutive periods
+-> Notification: payroll-critical-alerts SNS topic
+
+Alarm 3: RDS Free Storage Space
+-> Select Metric -> RDS -> Per-Database Metrics -> FreeStorageSpace
+-> Threshold: Less than 2 GB (2147483648 bytes)
+-> Datapoints to alarm: 1 out of 1 (storage running low is always critical)
+-> Notification: payroll-critical-alerts SNS topic
+
+The process is identical — select the RDS metric instead of EC2, set the threshold, and point it to the same SNS topic. Once RDS is provisioned in production, these alarms can be created in under 5 minutes each.
+
+5d. CloudWatch Log Groups
+We created log groups for application and infrastructure logs with sensible retention policies.
+
+Log Groups Created:
+-> /payroll/companies/application    (Retention: 90 days)
+-> /payroll/bureaus/application      (Retention: 90 days)
+-> /payroll/employees/application    (Retention: 90 days)
+-> /payroll/infrastructure/system    (Retention: 90 days)
+-> /payroll/rds/postgresql           (Retention: 90 days)
+-> /payroll/vpc-flow-logs            (Retention: 90 days)
+
+Setup (via AWS Console):
+1. Go to CloudWatch -> Log Groups -> Create log group
+2. Enter the log group name (e.g., /payroll/companies/application)
+3. Set Retention Setting to 90 days
+4. Repeat for each log group
+
+Why 90 days?
+-> UK GDPR requires that we can audit access and changes to personal data.
+-> 90 days balances compliance needs with storage cost (CloudWatch charges per GB ingested + stored).
+-> For deployment/audit logs, we could extend to 180 days if needed.
+
+Log Delivery:
+-> EC2 instances run the CloudWatch Agent, which pushes application logs (stdout/stderr) and system metrics to the correct log group.
+-> RDS logs (slow queries, errors) are enabled via the DB parameter group and automatically stream to CloudWatch.
+-> VPC Flow Logs are enabled on the VPC and sent to the /payroll/vpc-flow-logs group for network auditing.
+
+Summary
+-> SNS topic created and verified with email subscription (screenshot included).
+-> EC2 CPU alarm created, tested with a stress command, and confirmed working — email alert received (screenshot included).
+-> RDS alarms documented with exact steps — same process, just selecting RDS metrics instead of EC2.
+-> Log groups created with 90-day retention for compliance.
+-> All resources destroyed after capturing screenshots to avoid any charges.

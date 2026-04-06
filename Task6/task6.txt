@@ -1,0 +1,107 @@
+Task 6 — UK Compliance Considerations
+
+6a. AWS-Native Controls for UK GDPR Compliance (Employee PII & Bank Data)
+
+To stay compliant with UK GDPR when storing highly sensitive employee data (PII, bank account details, National Insurance numbers, payroll records), we would put the following AWS-native controls in place:
+
+Encryption:
+-> RDS encryption at rest enabled using AWS KMS (storage_encrypted = true in Task 1).
+-> S3 server-side encryption (SSE-S3 / AES-256) enforced on the payroll documents bucket.
+-> All data in transit protected via TLS 1.2+ (enforced on RDS connections and HTTPS-only access to S3).
+
+Access Control:
+-> IAM roles with least-privilege policies — each tenant type (Company, Bureau, Employee) has its own role with scoped permissions (implemented in Task 1 and Task 3).
+-> PostgreSQL Row-Level Security (RLS) ensures no cross-tenant data access at the database level (designed in Task 2).
+-> MFA enforced on all IAM users with console access, especially anyone who can access production resources.
+
+Logging & Auditing:
+-> AWS CloudTrail enabled for all API activity — provides a full audit trail of who accessed or modified what.
+-> CloudWatch Logs capture application-level access logs (who viewed/modified which records).
+-> VPC Flow Logs track all network traffic, useful for detecting unauthorized data exfiltration.
+-> S3 access logging enabled to monitor who downloaded payroll documents.
+
+Data Protection:
+-> S3 bucket versioning enabled — prevents accidental deletion and supports recovery of personal data.
+-> S3 Block Public Access enabled at account and bucket level — no payroll data can ever be made public accidentally.
+-> AWS Macie can be enabled to automatically scan S3 for exposed PII (names, bank details, NI numbers) and alert if sensitive data is found in unexpected locations.
+
+Breach Response:
+-> GuardDuty enabled for threat detection (unusual API calls, compromised credentials).
+-> AWS Config rules monitor for compliance drift (e.g., encryption disabled, public access enabled).
+-> SNS alerts configured to notify the team immediately on security events (configured in Task 5).
+-> Under UK GDPR, a personal data breach must be reported to the ICO within 72 hours — our monitoring and alerting setup ensures fast detection and response.
+
+6b. Ensuring Data Residency Within the UK/EU Region
+
+UK GDPR requires that personal data of UK residents is stored and processed within the UK or an adequate jurisdiction. We enforce this through:
+
+AWS Region Selection:
+-> All infrastructure is deployed in the eu-west-2 (London) region.
+-> The Terraform provider is configured with region = "eu-west-2" (in Task 1 main.tf), ensuring every resource — EC2, RDS, S3, CloudWatch — is provisioned in the UK.
+
+Preventing Accidental Cross-Region Deployment:
+-> IAM policies can include a Condition block to deny any resource creation outside eu-west-2:
+   JSON
+   {
+     "Effect": "Deny",
+     "Action": "*",
+     "Resource": "*",
+     "Condition": {
+       "StringNotEquals": {
+         "aws:RequestedRegion": "eu-west-2"
+       }
+     }
+   }
+-> This can be applied as a Service Control Policy (SCP) at the AWS Organizations level, making it impossible for any user or service to create resources in other regions.
+
+S3 Bucket Region Lock:
+-> S3 buckets are created in eu-west-2 and cannot be moved to another region after creation.
+-> Cross-region replication is NOT enabled — data stays in the London region.
+
+RDS & Backups:
+-> RDS instance is in eu-west-2 private subnets.
+-> Automated backups and snapshots are stored in the same region by default.
+-> If we ever need disaster recovery to another region, it would be within the EU (e.g., eu-west-1 Ireland), which is still an adequate jurisdiction under UK GDPR.
+
+6c. Handling Right to Erasure (Employee Data Deletion)
+
+Under UK GDPR Article 17, an employee has the right to request permanent deletion of their personal data. Here is how we would handle this across all services:
+
+Step 1: Receive and Validate the Request
+-> Employee submits a deletion request through the Employee Portal (or via email/support).
+-> The data controller (employer or platform admin) verifies the employee's identity.
+-> We check if any legal exemption applies (e.g., HMRC requires employers to retain payroll records for 6 years for tax purposes). If so, we inform the employee and retain only what is legally required.
+
+Step 2: Identify All Data Locations
+-> PostgreSQL (RDS): All tables with the employee's tenant_id/employee_id — payroll records, personal details, bank information, tax records.
+-> S3: All documents under the /employee/<employee_id>/ prefix — payslips, P60s, contracts, uploaded documents.
+-> CloudWatch Logs: Application logs that may contain references to the employee.
+-> Backups: RDS automated snapshots, S3 versioned objects.
+
+Step 3: Execute Deletion
+-> Database: Run a hard delete on all rows matching the employee_id across all relevant tables. Use a cascading delete or a dedicated deletion script that covers every table.
+   SQL
+   DELETE FROM payroll_records WHERE employee_id = 'emp-uuid';
+   DELETE FROM employee_details WHERE employee_id = 'emp-uuid';
+   DELETE FROM bank_accounts WHERE employee_id = 'emp-uuid';
+
+-> S3: Delete all objects under the employee's prefix, including all versioned copies:
+   Bash
+   aws s3 rm s3://payroll-documents-bucket/employee/emp-uuid/ --recursive
+   # Also delete version markers to fully purge versioned objects
+
+-> Application Logs: For logs that may contain the employee's name or identifiers, we apply a retention policy (90 days as configured in Task 5). Logs older than 90 days are automatically purged. For immediate compliance, we can filter and redact specific entries if needed, though this is operationally complex.
+
+-> Backups: RDS snapshots containing the employee's data will naturally expire based on the retention window (e.g., 7–35 days). We document this and inform the employee that backup data will be fully purged within the retention cycle. For S3 versioned objects, we explicitly delete all versions.
+
+Step 4: Confirm and Audit
+-> Generate a deletion certificate/confirmation record containing:
+   => Employee ID (anonymised after deletion)
+   => Date of request
+   => Date of deletion
+   => List of systems purged
+   => Name of person who executed the deletion
+-> Send confirmation to the employee that their data has been permanently deleted.
+-> Store the audit record (without any PII) for compliance evidence.
+
+This process ensures full compliance with the right to erasure while maintaining an audit trail that itself contains no personal data.

@@ -1,0 +1,74 @@
+Incident Response Runbook: RDS Database Accidentally Made Publicly Accessible
+
+Severity: P1 — Critical
+Affects: Payroll database containing employee PII, bank details, and payroll records
+
+--- DETECTION ---
+
+How we would know:
+-> AWS Config rule "rds-instance-public-access-check" flags the instance as non-compliant.
+-> CloudTrail logs a "ModifyDBInstance" API call with PubliclyAccessible parameter changed to true.
+-> VPC Flow Logs show unexpected inbound connections from public IPs on port 5432.
+-> GuardDuty generates a finding for unusual RDS network activity.
+
+Quick manual check:
+   aws rds describe-db-instances \
+     --db-instance-identifier payroll-db \
+     --query "DBInstances[0].PubliclyAccessible"
+
+--- INVESTIGATION (First 10 minutes) ---
+
+1. Confirm exposure:
+   -> Check if PubliclyAccessible = true (command above).
+   -> Check Security Group rules — does any rule allow 0.0.0.0/0 on port 5432?
+   -> If SG still restricts to VPC CIDRs only, the DB was flagged public but may not have been reachable from the internet. This matters for breach assessment.
+
+2. Identify who made the change:
+   -> Search CloudTrail for "ModifyDBInstance" events in the last 24-48 hours.
+   -> Look at the userIdentity field to find the IAM user/role responsible.
+   -> Determine if it was a manual console change, a Terraform apply, or automation.
+
+3. Check for unauthorised access:
+   -> Query pg_stat_activity for connections from non-private IP addresses:
+      SELECT pid, usename, client_addr, state, query_start
+      FROM pg_stat_activity
+      WHERE client_addr NOT IN ('10.0.0.0/8'::inet, '172.16.0.0/12'::inet);
+   -> Review RDS logs in CloudWatch for failed/successful login attempts from unknown sources.
+
+--- RECOVERY (Within 30 minutes) ---
+
+Step 1: Disable public access immediately
+   aws rds modify-db-instance \
+     --db-instance-identifier payroll-db \
+     --no-publicly-accessible \
+     --apply-immediately
+
+Step 2: Lock down Security Group (remove any 0.0.0.0/0 rules on port 5432)
+   aws ec2 revoke-security-group-ingress \
+     --group-id sg-XXXXXXXXX \
+     --protocol tcp --port 5432 --cidr 0.0.0.0/0
+
+Step 3: Rotate database credentials
+   -> Generate a new master password.
+   -> Update the password in AWS Secrets Manager.
+   -> Restart application services to pick up new credentials.
+
+Step 4: Kill any suspicious active sessions
+   SELECT pg_terminate_backend(pid)
+   FROM pg_stat_activity
+   WHERE client_addr NOT IN ('10.0.0.0/8'::inet, '172.16.0.0/12'::inet);
+
+Step 5: Verify recovery
+   -> Re-run the detection check to confirm PubliclyAccessible = false.
+   -> Confirm all three portals (Companies, Bureaus, Employees) are operational with new credentials.
+   -> Run terraform plan to verify the live state matches the desired IaC state.
+
+--- POST-INCIDENT ---
+
+-> Document the timeline: when it was exposed, when detected, when contained.
+-> If any external access was confirmed, initiate UK GDPR breach notification process (ICO must be notified within 72 hours).
+-> Add preventive guardrails:
+   => Enable AWS Config auto-remediation for the rds-instance-public-access-check rule.
+   => Restrict ModifyDBInstance permission to a break-glass IAM role only.
+   => Add a CloudWatch Events rule that triggers an instant SNS alert on any ModifyDBInstance call.
+-> Conduct a blameless post-mortem with the team within 48 hours.
